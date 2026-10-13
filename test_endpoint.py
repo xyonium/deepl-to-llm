@@ -117,6 +117,42 @@ class TestEndpointContract:
         out = r.json()["translations"][0]["text"]
         assert out == html  # unchanged -> safe
 
+    def test_tag_handling_html_in_form_body(self, client):
+        # Collabora sends tag_handling=html as a FORM FIELD, not a query
+        # param (verified by packet capture: query string is empty on real
+        # engine traffic). The endpoint must read it from the body or the
+        # whole request degrades to the plain path. Regression test for the
+        # short-cell bug (HANDOFF-collabora-short-cells.md, Fix A).
+        html = '<span><b>hello</b></span>'
+        with patch("main.llm_translate_items", side_effect=_stub_translate):
+            r = client.post(
+                "/translate",  # NOTE: no ?tag_handling=html query param
+                data={"text": html, "target_lang": "EN", "tag_handling": "html"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        out = r.json()["translations"][0]["text"]
+        # html path preserves tags; plain path would send raw markup to the
+        # translator and get it back reversed as one string
+        assert "<span>" in out and "<b>" in out
+        assert "olleh" in out
+
+    def test_tag_handling_query_param_wins_over_body(self, client):
+        # query string is the explicit override (manual testing); body is the
+        # engine's channel. If both present, query wins.
+        html = '<span><b>hello</b></span>'
+        with patch("main.llm_translate_items", side_effect=_stub_translate):
+            r = client.post(
+                "/translate?tag_handling=plain",
+                data={"text": html, "target_lang": "EN", "tag_handling": "html"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        out = r.json()["translations"][0]["text"]
+        # plain path: the whole string (tags included) went through the stub
+        # as one item -> reversed, tags NOT preserved positionally
+        assert out.startswith("[English]")
+
     def test_missing_text_returns_400(self, client):
         with patch("main.llm_translate_items", side_effect=_stub_translate):
             r = client.post("/translate", json={"target_lang": "ZH"}, headers=AUTH)
@@ -244,6 +280,116 @@ class TestDeepLPassthrough:
             r = client.post("/translate", json={"text": "hello", "target_lang": "ZH"}, headers=AUTH)
         assert r.status_code == 200
         mock_deepl.assert_not_called()  # DeepL endpoint never hit
+
+    def test_deepl_identity_cjk_falls_back_to_llm(self, client, monkeypatch):
+        # DeepL verbatim-returns short CJK fragments (1-5 chars) with HTTP 200
+        # — a "successful" non-translation. That must be detected and routed
+        # to the LLM, or short table cells stay untranslated (HANDOFF Fix B).
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        def deepl_returns_identity(payload):
+            return {"translations": [
+                {"detected_source_language": "ZH", "text": t}
+                for t in payload["text"]
+            ]}
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=deepl_returns_identity):
+            r = client.post(
+                "/translate",
+                json={"text": "文件编号", "target_lang": "DE"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        out = r.json()["translations"][0]["text"]
+        # LLM stub ran (reversed + tagged); DeepL's identity was NOT accepted
+        assert out.startswith("[German]")
+        assert "文件编号" not in out
+
+    def test_deepl_real_translation_not_treated_as_identity(self, client, monkeypatch):
+        # Guard against over-triggering: when DeepL genuinely translates, the
+        # identity check must NOT fire and the LLM must stay unused.
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        def deepl_stub(payload):
+            return {"translations": [
+                {"detected_source_language": "ZH", "text": f"DE:{t}"}
+                for t in payload["text"]
+            ]}
+        llm_called = []
+        def llm_should_not_be_called(items, target):
+            llm_called.append(True)
+            return items
+        with patch("main.llm_translate_items", side_effect=llm_should_not_be_called), \
+             patch("main._deepl_post", side_effect=deepl_stub):
+            r = client.post(
+                "/translate",
+                json={"text": "这是一段需要翻译的长中文文本内容", "target_lang": "DE"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        assert r.json()["translations"][0]["text"].startswith("DE:")
+        assert llm_called == []
+
+    def test_deepl_identity_non_cjk_not_fallback(self, client, monkeypatch):
+        # Non-CJK identity (e.g. a proper noun, number, or already-target-lang
+        # string) is legitimate — don't waste an LLM round-trip on it.
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        def deepl_identity(payload):
+            return {"translations": [
+                {"detected_source_language": "EN", "text": t}
+                for t in payload["text"]
+            ]}
+        llm_called = []
+        def llm_should_not_be_called(items, target):
+            llm_called.append(True)
+            return items
+        with patch("main.llm_translate_items", side_effect=llm_should_not_be_called), \
+             patch("main._deepl_post", side_effect=deepl_identity):
+            r = client.post(
+                "/translate",
+                json={"text": "COVID-19", "target_lang": "DE"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        assert r.json()["translations"][0]["text"] == "COVID-19"
+        assert llm_called == []
+
+    def test_deepl_html_raw_identity_falls_back_to_llm(self, client, monkeypatch):
+        # HTML raw path: DeepL echoes <b>文件编号</b> back unchanged (HTTP 200).
+        # Identity on text content (tags stripped) must fall back to the LLM.
+        monkeypatch.setenv("DEEPL_API_KEY", "fake-deepl-key:fx")
+        monkeypatch.setenv("DEEPL_API_URL", "https://api-free.deepl.com/v2/translate")
+        import importlib, main
+        importlib.reload(main)
+
+        html_in = '<span><b>文件编号</b></span>'
+        def deepl_identity(payload):
+            return {"translations": [
+                {"detected_source_language": "ZH", "text": payload["text"][0]}
+            ]}
+        with patch("main.llm_translate_items", side_effect=_stub_translate), \
+             patch("main._deepl_post", side_effect=deepl_identity):
+            r = client.post(
+                "/translate?tag_handling=html",
+                data={"text": html_in, "target_lang": "DE"},
+                headers=AUTH,
+            )
+        assert r.status_code == 200
+        out = r.json()["translations"][0]["text"]
+        # bridge/LLM path ran: tags preserved, text translated (stub reverses)
+        assert "<b>" in out
+        assert "号编件文" in out  # reversed 文件编号
+        assert ">文件编号<" not in out
 
     def test_deepl_html_raw_passthrough_no_extract_refill(self, client, monkeypatch):
         # When DEEPL_API_KEY is set and tag_handling=html, the bridge must

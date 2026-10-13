@@ -1,6 +1,10 @@
 FROM python:3.11-slim
 WORKDIR /app
 
+# Image carries the Collabora short-cell fix: tag_handling read from the POST
+# body (not only the query string) + DeepL CJK-identity responses fall back to
+# the LLM. See docs/HANDOFF-collabora-short-cells.md.
+
 # 设置时区和环境变量
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1

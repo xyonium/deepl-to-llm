@@ -16,6 +16,7 @@ header/footer duplication (Bug 1) and lost run formatting (Bug 2).
 """
 import json
 import os
+import re
 import sys
 import time
 from typing import List, Optional
@@ -45,9 +46,20 @@ def _log(level: str, msg: str) -> None:
 
 
 def _trunc(s: str, n: int = 800) -> str:
-    """Truncate a string for logging, showing head + tail + length."""
+    """Truncate a string for logging, showing head + tail + length.
+
+    Set LOG_FULL=1 to disable truncation entirely - logs the raw string
+    verbatim. Used when debugging request bodies (e.g. to see whether a
+    Collabora translation request concatenated header+cell+footer into one
+    text[] element). Verbose; leave off in normal operation.
+    """
     if s is None:
         return "<None>"
+    # Strip surrounding quotes too: docker-compose list syntax `- LOG_FULL="1"`
+    # injects the literal "1" (with quotes) unless written as map syntax.
+    _full = os.getenv("LOG_FULL", "").strip().strip('"').strip("'").lower()
+    if _full in ("1", "true", "yes", "on"):
+        return s
     if len(s) <= n:
         return s
     return f"{s[:n//2]}…[{len(s)} chars]…{s[-n//4:]}"
@@ -240,6 +252,20 @@ def deepl_translate_items(texts: List[str], target_lang: str, tag_handling: str)
     return out
 
 
+def _strip_html(t: str) -> str:
+    """Remove HTML tags for identity comparison (DeepL may return the tags
+    unchanged around untranslated text; only the text content matters)."""
+    return re.sub(r"<[^>]+>", "", t).strip()
+
+
+def _has_cjk(t: str) -> bool:
+    """True if the string contains CJK unified ideographs. DeepL's identity
+    problem (returning input verbatim) only shows on short CJK fragments —
+    Latin/Cyrillic source text translates reliably, so don't pay an LLM
+    round-trip for those."""
+    return bool(re.search(r"[一-鿿぀-ヿ가-힯]", t))
+
+
 def translate_items(texts: List[str], target_lang: str, target_lang_name: str,
                     tag_handling: str) -> List[str]:
     """Route translation to DeepL (if configured) with LLM fallback.
@@ -247,10 +273,28 @@ def translate_items(texts: List[str], target_lang: str, target_lang_name: str,
     DeepL first when DEEPL_API_KEY is set; on any DeepL failure (rate limit,
     quota, network), fall back to the LLM. When no DeepL key is configured,
     use the LLM directly. Logs which backend served the request.
+
+    IDENTITY FALLBACK: DeepL verbatim-returns short CJK fragments (1–5 chars)
+    at a high rate (observed: 98% of 1–2 char, 27% of 3–5 char in 72h of real
+    Collabora traffic) and reports HTTP 200 — a "successful" non-translation.
+    That used to be treated as success, so the LLM never got a chance at the
+    short cells. Detect any CJK item whose translation is identical to its
+    source (tags stripped) and route the whole batch to the LLM instead.
     """
     if DEEPL_API_KEY:
         try:
             out = deepl_translate_items(texts, target_lang, tag_handling)
+            identity = [
+                t for t, o in zip(texts, out)
+                if len(out) == len(texts)
+                and _strip_html(o) == _strip_html(t)
+                and _has_cjk(_strip_html(t))
+            ]
+            if identity:
+                _log("info", f"[BACKEND] DeepL returned identity for "
+                     f"{len(identity)}/{len(texts)} CJK item(s) "
+                     f"(e.g. {_trunc(identity[0], 60)}); falling back to LLM")
+                raise RuntimeError("identity")
             _log("info", f"[BACKEND] DeepL served {len(out)}/{len(texts)} items")
             return out
         except Exception as e:
@@ -268,6 +312,11 @@ def deepl_translate_html_raw(html_str: str, target_lang: str) -> str:
     Used for the HTML path when DEEPL_API_KEY is set, so the behavior matches
     real DeepL as closely as possible (A/B testing). Raises on DeepL failure
     so the caller can fall back to the LLM (extract/refill) path.
+
+    IDENTITY CHECK: DeepL verbatim-returns short CJK fragments inside tags
+    (e.g. <b>文件编号</b>) with HTTP 200 — a "successful" non-translation.
+    Detect text-content identity (tags stripped) and raise so the endpoint
+    falls back to the bridge/LLM path, which translates short CJK reliably.
     """
     payload = {"text": [html_str], "target_lang": target_lang.upper(),
                "tag_handling": "html", "split_sentences": "nonewlines"}
@@ -281,6 +330,10 @@ def deepl_translate_html_raw(html_str: str, target_lang: str) -> str:
     out = str(trans[0].get("text", ""))
     _log("debug", f"[DEEPL-RAW-RESP] {elapsed:.2f}s out_len={len(out)} "
           f"out={_trunc(out)}")
+    if _strip_html(out) == _strip_html(html_str) and _has_cjk(_strip_html(html_str)):
+        _log("info", f"[BACKEND] DeepL(raw) returned identity for CJK text "
+             f"{_trunc(_strip_html(html_str), 60)}; falling back to LLM")
+        raise RuntimeError("identity")
     return out
 
 
@@ -298,7 +351,12 @@ async def translate(request: Request, _=Depends(verify_token)):
 
     text_data = data.get("text")
     target_lang = data.get("target_lang", "ZH")
-    tag_handling = request.query_params.get("tag_handling", "plain")
+    # Collabora puts tag_handling in the POST body (form field), NOT the query
+    # string — the query string is empty on real engine traffic. Accept both,
+    # query string wins so manual tests can override. (HANDOFF: short-cell bug)
+    tag_handling = (request.query_params.get("tag_handling")
+                    or data.get("tag_handling")
+                    or "plain")
 
     # Normalize to a list of strings. DeepL accepts text as a string OR an
     # array; we always translate element-wise and return one per element.

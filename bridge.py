@@ -46,6 +46,12 @@ def _blog(level: str, msg: str) -> None:
 def _btrunc(s: str, n: int = 800) -> str:
     if s is None:
         return "<None>"
+    # Honor the same LOG_FULL switch as main._trunc so extract/refill HTML
+    # bodies also log verbatim when debugging (see main._trunc docstring).
+    # Strip surrounding quotes: `- LOG_FULL="1"` injects literal "1".
+    _full = os.getenv("LOG_FULL", "").strip().strip('"').strip("'").lower()
+    if _full in ("1", "true", "yes", "on"):
+        return s
     if len(s) <= n:
         return s
     return f"{s[:n//2]}…[{len(s)} chars]…{s[-n//4:]}"
